@@ -81,6 +81,53 @@ class PRSubmission:
     submitted_at_block: bigint
 
 
+def _extract_repo_path(url: str) -> str:
+    """
+    Extracts canonical 'owner/repo' identifier from a GitHub repository or PR URL.
+    Normalizes lowercase, strips trailing slashes, and removes '.git' suffix.
+    Returns '' if the URL is not a valid GitHub repository or PR URL.
+    """
+    clean = url.strip()
+    if "://" in clean:
+        clean = clean.split("://", 1)[1]
+    parts = [p.strip() for p in clean.split("/") if p.strip()]
+    if len(parts) >= 3 and "github.com" in parts[0].lower():
+        owner = parts[1].lower()
+        repo = parts[2].lower()
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        return f"{owner}/{repo}"
+    return ""
+
+
+def _get_current_block_or_timestamp() -> bigint:
+    """
+    Returns current block number or transaction timestamp context.
+    In GenLayer GenVM Python runtime (v0.2.16 / v0.3.0), 'gl.block.number'
+    is not exposed and raises AttributeError. GenVM instead provides the transaction
+    timestamp via 'gl.message_raw["datetime"]'. We record this live timestamp as
+    freshness context, falling back gracefully to bigint(0).
+    """
+    try:
+        if hasattr(gl, "block") and hasattr(gl.block, "number"):
+            return bigint(gl.block.number)
+    except Exception:
+        pass
+
+    try:
+        raw_dt = gl.message_raw.get("datetime", "")
+        if raw_dt:
+            if raw_dt.endswith("Z"):
+                raw_dt = raw_dt[:-1] + "+00:00"
+            import datetime
+            dt = datetime.datetime.fromisoformat(raw_dt)
+            return bigint(int(dt.timestamp()))
+    except Exception:
+        pass
+
+    return bigint(0)
+
+
 class Contract(gl.Contract):
     """
     Intelligent Contract primitive for automated PR and bounty auditing.
@@ -107,7 +154,7 @@ class Contract(gl.Contract):
     def _execute_pr_evaluation(self, pr_url: str, criteria: str) -> dict:
         """
         Executes decentralized evaluation of a PR against acceptance criteria
-        using gl.vm.run_nondet_unsafe with semantic consensus.
+        using gl.vm.run_nondet with semantic consensus.
         """
         # Read parameters beforehand; DO NOT access 'self' inside nondet routines
         captured_url = pr_url
@@ -157,16 +204,34 @@ class Contract(gl.Contract):
             raw_resp = gl.nondet.exec_prompt(prompt, response_format="json")
 
             try:
-                parsed = json.loads(raw_resp)
+                if isinstance(raw_resp, dict):
+                    parsed = raw_resp
+                else:
+                    clean_json = str(raw_resp).strip()
+                    if clean_json.startswith("```"):
+                        lines = clean_json.splitlines()
+                        if lines and lines[0].startswith("```"):
+                            lines = lines[1:]
+                        if lines and lines[-1].startswith("```"):
+                            lines = lines[:-1]
+                        clean_json = "\n".join(lines).strip()
+
+                    start_i = clean_json.find("{")
+                    end_i = clean_json.rfind("}")
+                    if start_i != -1 and end_i != -1 and end_i > start_i:
+                        clean_json = clean_json[start_i:end_i+1]
+
+                    parsed = json.loads(clean_json)
+
                 verdict = str(parsed.get("verdict", "")).strip().upper()
                 if verdict not in ("ACCEPTED", "REVISIONS_NEEDED", "REJECTED"):
                     verdict = "REJECTED"
                 reason = str(parsed.get("reason", "")).strip()
                 if not reason:
                     reason = "No reasoning provided by LLM."
-            except Exception:
+            except Exception as e:
                 verdict = "REJECTED"
-                reason = "Failed to parse evaluation response JSON."
+                reason = f"Failed to parse evaluation response: {str(e)}"
 
             return {"verdict": verdict, "reason": reason}
 
@@ -197,8 +262,8 @@ class Contract(gl.Contract):
             # Compare semantic verdict meaning only, ignoring variations in reasoning text
             return leader_verdict == my_verdict
 
-        # Execute consensus through the GenLayer VM
-        consensus_result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+        # Execute consensus through the GenLayer VM using sandboxed run_nondet
+        consensus_result = gl.vm.run_nondet(leader_fn, validator_fn)
 
         if hasattr(consensus_result, "calldata"):
             final_data = consensus_result.calldata
@@ -242,8 +307,7 @@ class Contract(gl.Contract):
         bounty_id = f"bounty_{str(self.bounty_counter)}"
 
         zero_address = Address("0x0000000000000000000000000000000000000000")
-        # FIX TASK 2: Use live block number
-        current_block = bigint(gl.block.number)
+        current_block = _get_current_block_or_timestamp()
 
         new_bounty = Bounty(
             bounty_id=bounty_id,
@@ -296,8 +360,10 @@ class Contract(gl.Contract):
         if "github.com" not in clean_pr_url or "/pull/" not in clean_pr_url:
             raise gl.vm.UserError("PR URL must be a valid GitHub pull request URL containing /pull/")
 
-        # FIX TASK 1: Validate PR Repository
-        if bounty.repo_url not in clean_pr_url:
+        # Strict validation: PR must belong to the exact repository configured for the bounty
+        bounty_repo = _extract_repo_path(bounty.repo_url)
+        pr_repo = _extract_repo_path(clean_pr_url)
+        if not bounty_repo or not pr_repo or bounty_repo != pr_repo:
             raise ValueError("Security Error: The submitted Pull Request does not belong to this bounty's repository.")
 
         # Execute decentralized consensus evaluation
@@ -308,8 +374,7 @@ class Contract(gl.Contract):
 
         self.submission_counter = self.submission_counter + bigint(1)
         submission_id = f"sub_{str(self.submission_counter)}"
-        # FIX TASK 2: Use live block number
-        current_block = bigint(gl.block.number)
+        current_block = _get_current_block_or_timestamp()
 
         new_submission = PRSubmission(
             submission_id=submission_id,

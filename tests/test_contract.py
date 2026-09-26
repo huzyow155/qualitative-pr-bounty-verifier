@@ -254,3 +254,26 @@ def test_submit_pr_unrelated_repo_reverts(direct_vm, direct_deploy, direct_alice
                 pr_url="https://github.com/attacker/malicious-repo/pull/1",
             )
 
+
+def test_submit_pr_same_prefix_malicious_repo_reverts(direct_vm, direct_deploy, direct_alice, direct_bob):
+    """
+    Verifies that a PR to a repository with the same prefix (e.g. foo/bar-malicious)
+    is strictly rejected when the bounty is for foo/bar, preventing substring bypass.
+    """
+    contract = direct_deploy("contracts/contract.py")
+    with direct_vm.prank(direct_alice):
+        bounty_id = contract.create_bounty(
+            title="Prevent Substring Bypass",
+            repo_url="https://github.com/foo/bar",
+            acceptance_criteria="Strict canonical repository matching.",
+            reward_amount=500,
+        )
+
+    with direct_vm.prank(direct_bob):
+        with direct_vm.expect_revert("Security Error: The submitted Pull Request does not belong to this bounty's repository."):
+            contract.submit_pr_for_evaluation(
+                bounty_id=bounty_id,
+                pr_url="https://github.com/foo/bar-malicious/pull/1",
+            )
+
+
